@@ -1,0 +1,9 @@
+name = "spotify-echo-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "TOKENS_KV"
+id = "b2ab4145cb08448fa9a4af57bc180c23"  # Production namespace ID
+preview_id = "44fe872041684bd388c10a5182967143"  # Local development namespace ID
+

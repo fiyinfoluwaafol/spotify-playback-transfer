@@ -1,0 +1,10 @@
+# Local Development Environment Variables
+# Copy this file to .dev.vars and fill in your actual values
+# Wrangler will automatically load .dev.vars when running `wrangler dev`
+
+SPOTIFY_CLIENT_ID=your_spotify_client_id_here
+SPOTIFY_CLIENT_SECRET=your_spotify_client_secret_here
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8787/callback
+AUTOMATION_KEY=your_automation_key_here
+BASE_URL=http://127.0.0.1:8787
+
