@@ -72,6 +72,71 @@ function jsonSuccess(data: any, status: number = 200): Response {
   });
 }
 
+const TRANSFER_RETRY_ATTEMPTS = 3;
+const TRANSFER_RETRY_BASE_DELAY_MS = 350;
+const TRANSFER_RETRY_MAX_DELAY_MS = 2000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryTransfer(response: Response): boolean {
+  if (response.status === 404 || response.status === 429) {
+    return true;
+  }
+  return response.status >= 500 && response.status <= 504;
+}
+
+function getRetryDelayMs(attempt: number, response?: Response): number {
+  if (response?.status === 429) {
+    const retryAfter = response.headers.get('Retry-After');
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      if (!Number.isNaN(seconds)) {
+        return Math.min(seconds * 1000, TRANSFER_RETRY_MAX_DELAY_MS);
+      }
+      const retryDate = Date.parse(retryAfter);
+      if (!Number.isNaN(retryDate)) {
+        const delta = retryDate - Date.now();
+        if (delta > 0) {
+          return Math.min(delta, TRANSFER_RETRY_MAX_DELAY_MS);
+        }
+      }
+    }
+  }
+
+  const delay = TRANSFER_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+  return Math.min(delay, TRANSFER_RETRY_MAX_DELAY_MS);
+}
+
+async function retryTransfer(makeRequest: () => Promise<Response>): Promise<Response> {
+  let lastResponse: Response | null = null;
+
+  for (let attempt = 1; attempt <= TRANSFER_RETRY_ATTEMPTS; attempt++) {
+    try {
+      const response = await makeRequest();
+      lastResponse = response;
+
+      if (response.ok || !shouldRetryTransfer(response) || attempt === TRANSFER_RETRY_ATTEMPTS) {
+        return response;
+      }
+
+      const delayMs = getRetryDelayMs(attempt, response);
+      console.warn(`Transfer failed with ${response.status}. Retrying in ${delayMs}ms...`);
+      await sleep(delayMs);
+    } catch (error) {
+      if (attempt === TRANSFER_RETRY_ATTEMPTS) {
+        throw error;
+      }
+      const delayMs = getRetryDelayMs(attempt);
+      console.warn(`Transfer error. Retrying in ${delayMs}ms...`, error);
+      await sleep(delayMs);
+    }
+  }
+
+  return lastResponse ?? new Response('Transfer retry attempts exhausted', { status: 500 });
+}
+
 /**
  * Handle OPTIONS preflight requests
  */
@@ -303,16 +368,18 @@ async function handleTransfer(request: Request, env: Env): Promise<Response> {
       return addCorsHeaders(jsonError('INVALID_REQUEST', 'deviceId is required', 400));
     }
 
-    const response = await spotifyFetch(
-      '/me/player',
-      {
-        method: 'PUT',
-        body: JSON.stringify({
-          device_ids: [deviceId],
-          play: play !== undefined ? play : true,
-        }),
-      },
-      env
+    const response = await retryTransfer(() =>
+      spotifyFetch(
+        '/me/player',
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            device_ids: [deviceId],
+            play: play !== undefined ? play : true,
+          }),
+        },
+        env
+      )
     );
 
     if (!response.ok) {
@@ -414,16 +481,18 @@ async function handleTransferEcho(env: Env): Promise<Response> {
     const targetDevice = echoDevices[0];
 
     // Transfer playback to the Echo device
-    const transferResponse = await spotifyFetch(
-      '/me/player',
-      {
-        method: 'PUT',
-        body: JSON.stringify({
-          device_ids: [targetDevice.id],
-          play: true,
-        }),
-      },
-      env
+    const transferResponse = await retryTransfer(() =>
+      spotifyFetch(
+        '/me/player',
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            device_ids: [targetDevice.id],
+            play: true,
+          }),
+        },
+        env
+      )
     );
 
     if (!transferResponse.ok) {
@@ -568,4 +637,3 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 export default {
   fetch: handleRequest,
 };
-
