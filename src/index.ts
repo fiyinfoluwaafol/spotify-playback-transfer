@@ -109,15 +109,20 @@ function getRetryDelayMs(attempt: number, response?: Response): number {
   return Math.min(delay, TRANSFER_RETRY_MAX_DELAY_MS);
 }
 
-async function retryTransfer(makeRequest: () => Promise<Response>): Promise<Response> {
+async function retryTransfer(
+  makeRequest: () => Promise<Response>,
+  options?: { maxAttempts?: number; initialAttempt?: number }
+): Promise<Response> {
+  const maxAttempts = options?.maxAttempts ?? TRANSFER_RETRY_ATTEMPTS;
+  let attempt = options?.initialAttempt ?? 1;
   let lastResponse: Response | null = null;
 
-  for (let attempt = 1; attempt <= TRANSFER_RETRY_ATTEMPTS; attempt++) {
+  for (; attempt <= maxAttempts; attempt++) {
     try {
       const response = await makeRequest();
       lastResponse = response;
 
-      if (response.ok || !shouldRetryTransfer(response) || attempt === TRANSFER_RETRY_ATTEMPTS) {
+      if (response.ok || !shouldRetryTransfer(response) || attempt === maxAttempts) {
         return response;
       }
 
@@ -125,7 +130,7 @@ async function retryTransfer(makeRequest: () => Promise<Response>): Promise<Resp
       console.warn(`Transfer failed with ${response.status}. Retrying in ${delayMs}ms...`);
       await sleep(delayMs);
     } catch (error) {
-      if (attempt === TRANSFER_RETRY_ATTEMPTS) {
+      if (attempt === maxAttempts) {
         throw error;
       }
       const delayMs = getRetryDelayMs(attempt);
@@ -135,6 +140,19 @@ async function retryTransfer(makeRequest: () => Promise<Response>): Promise<Resp
   }
 
   return lastResponse ?? new Response('Transfer retry attempts exhausted', { status: 500 });
+}
+
+function inProgressResponse(message: string): Response {
+  return addCorsHeaders(
+    jsonSuccess(
+      {
+        success: true,
+        status: 'RETRYING',
+        message,
+      },
+      202
+    )
+  );
 }
 
 /**
@@ -359,7 +377,12 @@ async function handleGetDevices(env: Env): Promise<Response> {
  * Transfers playback to a specified device
  * Body: { deviceId: string, play?: boolean }
  */
-async function handleTransfer(request: Request, env: Env): Promise<Response> {
+async function handleTransfer(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  asyncTransfer: boolean
+): Promise<Response> {
   try {
     const body = await request.json().catch(() => ({}));
     const { deviceId, play } = body;
@@ -368,7 +391,7 @@ async function handleTransfer(request: Request, env: Env): Promise<Response> {
       return addCorsHeaders(jsonError('INVALID_REQUEST', 'deviceId is required', 400));
     }
 
-    const response = await retryTransfer(() =>
+    const makeRequest = () =>
       spotifyFetch(
         '/me/player',
         {
@@ -379,8 +402,18 @@ async function handleTransfer(request: Request, env: Env): Promise<Response> {
           }),
         },
         env
-      )
-    );
+      );
+
+    let response: Response;
+    if (asyncTransfer) {
+      response = await makeRequest();
+      if (!response.ok && shouldRetryTransfer(response)) {
+        ctx.waitUntil(retryTransfer(makeRequest, { initialAttempt: 2 }));
+        return inProgressResponse('Transfer in progress. Retrying and will complete shortly.');
+      }
+    } else {
+      response = await retryTransfer(makeRequest);
+    }
 
     if (!response.ok) {
       if (isPremiumRequiredError(response)) {
@@ -420,7 +453,11 @@ async function handleTransfer(request: Request, env: Env): Promise<Response> {
  * Transfers playback to Echo Dot device (auto-resolves by name)
  * No body required
  */
-async function handleTransferEcho(env: Env): Promise<Response> {
+async function handleTransferEcho(
+  env: Env,
+  ctx: ExecutionContext,
+  asyncTransfer: boolean
+): Promise<Response> {
   try {
     // First, get list of devices
     const devicesResponse = await spotifyFetch('/me/player/devices', { method: 'GET' }, env);
@@ -481,7 +518,7 @@ async function handleTransferEcho(env: Env): Promise<Response> {
     const targetDevice = echoDevices[0];
 
     // Transfer playback to the Echo device
-    const transferResponse = await retryTransfer(() =>
+    const makeRequest = () =>
       spotifyFetch(
         '/me/player',
         {
@@ -492,8 +529,20 @@ async function handleTransferEcho(env: Env): Promise<Response> {
           }),
         },
         env
-      )
-    );
+      );
+
+    let transferResponse: Response;
+    if (asyncTransfer) {
+      transferResponse = await makeRequest();
+      if (!transferResponse.ok && shouldRetryTransfer(transferResponse)) {
+        ctx.waitUntil(retryTransfer(makeRequest, { initialAttempt: 2 }));
+        return inProgressResponse(
+          `Transfer to ${targetDevice.name} in progress. Retrying and will complete shortly.`
+        );
+      }
+    } else {
+      transferResponse = await retryTransfer(makeRequest);
+    }
 
     if (!transferResponse.ok) {
       if (isPremiumRequiredError(transferResponse)) {
@@ -567,10 +616,20 @@ async function requireAuth(env: Env): Promise<Response | null> {
 /**
  * Main request handler
  */
-async function handleRequest(request: Request, env: Env): Promise<Response> {
+async function handleRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  const asyncParam = url.searchParams.get('async');
+  const asyncTransfer =
+    asyncParam === null ||
+    asyncParam === '' ||
+    asyncParam === '1' ||
+    asyncParam === 'true';
 
   // Handle CORS preflight
   if (method === 'OPTIONS' && path.startsWith('/api')) {
@@ -616,11 +675,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
 
     if (method === 'POST' && path === '/api/transfer') {
-      return handleTransfer(request, env);
+      return handleTransfer(request, env, ctx, asyncTransfer);
     }
 
     if (method === 'POST' && path === '/api/transfer/echo') {
-      return handleTransferEcho(env);
+      return handleTransferEcho(env, ctx, asyncTransfer);
     }
 
     // 404 for unknown API routes
